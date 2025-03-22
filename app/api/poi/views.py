@@ -48,10 +48,16 @@ class FilterRequest(BaseModel):
     ]
     with_summarization: bool = Field(default=False)
 
-class POI(BaseModel):
-    id: int
-    name: str
-    type: str
+class POIBase(BaseModel):
+    id: int = Field(default=0)
+    name: str = Field(default="NOVOSIB")
+    type: str = Field(default="place")
+    website: str = Field(default="https://novosib.com")
+
+class POIPlace(POIBase):
+    population: str = Field(default=10000)
+    place: str = Field(default="city")
+
 
 class SummarizationResponse(BaseModel):
     about_flight: str
@@ -59,7 +65,7 @@ class SummarizationResponse(BaseModel):
 
 class FlightPOIResponse(BaseModel):
     aggregations: Dict[str, int]
-    pois: List[POI]
+    pois: List[POIBase]
 
 # --- Эндпойнт для получения минимальной информации по POI с агрегацией ---
 @router.post("/flight/{icao24}/pois", response_model=FlightPOIResponse)
@@ -101,8 +107,11 @@ async def get_aggregated_pois(icao24: str, filter: FilterRequest):
         poi_type = node.tags.get("place") or node.tags.get("historic") or node.tags.get("natural") or node.tags.get("tourism")
         if not poi_type:
             continue
-        pois.append(POI(id=node.id, name=node.tags.get("name", "Unknown"), type=poi_type))
+        pois.append(POIBase(id=node.id, name=node.tags.get("name", "Unknown"), type=poi_type))
         aggregations[poi_type] = aggregations.get(poi_type, 0) + 1
+        print(node.tags)
+        print(node.wikidata_link)
+        print("=========")
     return FlightPOIResponse(aggregations=aggregations, pois=pois)
 
 
@@ -190,3 +199,4 @@ async def get_pois_details(poi_ids_request: PoiIdsRequest):
         result[node.id] = poi_detail
 
     return result
+

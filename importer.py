@@ -1,11 +1,9 @@
 import os
 import shutil
-import tempfile
 import zipfile
 
 import ijson
 import requests
-import json
 
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING, GEOSPHERE

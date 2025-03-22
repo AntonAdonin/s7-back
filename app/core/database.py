@@ -35,3 +35,9 @@ def get_positions():
 def get_metadata():
     global db
     return db["flight_metadata"]
+
+
+from wikidata.client import Client
+client = Client()
+# TODO
+#GET IMAGES FROM WIKIDIATA
