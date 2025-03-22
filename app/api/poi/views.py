@@ -1,12 +1,13 @@
-import logging
 import os
 from enum import Enum
-from typing import Optional, Union, List, Dict
+from typing import Union, List, Dict
 
+from SPARQLWrapper import SPARQLWrapper, JSON
 from aio_overpass import Client, Query
-from aio_overpass.element import collect_elements
+from aio_overpass.element import collect_elements, Node
 from fastapi import APIRouter
 from fastapi import HTTPException
+from openai import OpenAI, AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from app.api.service.flight import get_flight_info
@@ -19,13 +20,14 @@ router = APIRouter(prefix="/poi", tags=["poi"])
 # --- Общие модели и перечисления ---
 
 class Operator(str, Enum):
-    EQ = "="     # равенство
-    NEQ = "!="   # не равенство
+    EQ = "="  # равенство
+    NEQ = "!="  # не равенство
     REGEX = "~"  # регулярное выражение
-    LT = "<"     # меньше
-    GT = ">"     # больше
-    LTE = "<="   # меньше или равно
-    GTE = ">="   # больше или равно
+    LT = "<"  # меньше
+    GT = ">"  # больше
+    LTE = "<="  # меньше или равно
+    GTE = ">="  # больше или равно
+
 
 class FilterCondition(BaseModel):
     """
@@ -36,6 +38,7 @@ class FilterCondition(BaseModel):
     key: str
     operator: Operator | None = Operator.EQ
     value: Union[str, int, float] | None = None
+
 
 class FilterRequest(BaseModel):
     distance: int = Field(default=400, ge=0)
@@ -48,24 +51,69 @@ class FilterRequest(BaseModel):
     ]
     with_summarization: bool = Field(default=False)
 
-class POIBase(BaseModel):
+
+class POI(BaseModel):
     id: int = Field(default=0)
-    name: str = Field(default="NOVOSIB")
+    name: str = Field(default="Novosibirsk")
     type: str = Field(default="place")
-    website: str = Field(default="https://novosib.com")
-
-class POIPlace(POIBase):
-    population: str = Field(default=10000)
-    place: str = Field(default="city")
-
-
-class SummarizationResponse(BaseModel):
-    about_flight: str
+    description: str = Field(default="Description")
+    image_url: str = Field(
+        default="https://avatars.mds.yandex.net/i?id=575a8e9e87e6782ddc215eabc924489ddb142866-5298260-images-thumbs&n=13")
+    website: str = Field(default="https://s7.ru")
 
 
 class FlightPOIResponse(BaseModel):
     aggregations: Dict[str, int]
-    pois: List[POIBase]
+    pois: List[POI]
+
+
+def get_entities_data(q_ids, lang="ru"):
+    """
+    Принимает список Q-идентификаторов и возвращает данные сущностей, включая:
+      - Название (itemLabel)
+      - Описание (description)
+      - Изображение (P18)
+      - Тип объекта (instance of, P31)
+      - Географические координаты (P625)
+      - Административное деление (P131)
+      - Официальный сайт (P856)
+      - Дата основания (P571)
+
+    :param q_ids: список идентификаторов (например, ["Q42", "Q5", "Q64"])
+    :param lang: язык для меток и описаний (по умолчанию "ru")
+    :return: список словарей с данными сущностей
+    """
+    sparql = SPARQLWrapper("https://query.wikidata.org/sparql")
+
+    # Формируем часть VALUES для SPARQL запроса
+    values_clause = " ".join(f"wd:{qid}" for qid in q_ids)
+
+    # SPARQL-запрос с дополнительными опциональными свойствами
+    query = f"""
+    SELECT ?item ?itemLabel ?description ?image ?instanceOf ?instanceOfLabel ?coordinates ?admin ?adminLabel ?website ?inception WHERE {{
+      VALUES ?item {{ {values_clause} }}
+
+      OPTIONAL {{
+        ?item schema:description ?description .
+        FILTER(LANG(?description) = "{lang}")
+      }}
+      OPTIONAL {{ ?item wdt:P18 ?image. }}          # Изображение
+      OPTIONAL {{ ?item wdt:P31 ?instanceOf. }}      # Тип объекта (instance of)
+      OPTIONAL {{ ?item wdt:P625 ?coordinates. }}    # Географические координаты
+      OPTIONAL {{ ?item wdt:P131 ?admin. }}          # Административное деление
+      OPTIONAL {{ ?item wdt:P856 ?website. }}        # Официальный сайт
+      OPTIONAL {{ ?item wdt:P571 ?inception. }}      # Дата основания
+
+      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{lang},en". }}
+    }}
+    """
+
+    sparql.setQuery(query)
+    sparql.setReturnFormat(JSON)
+
+    results = sparql.query().convert()
+    return results["results"]["bindings"]
+
 
 # --- Эндпойнт для получения минимальной информации по POI с агрегацией ---
 @router.post("/flight/{icao24}/pois", response_model=FlightPOIResponse)
@@ -98,20 +146,44 @@ async def get_aggregated_pois(icao24: str, filter: FilterRequest):
     await api.run_query(query)
 
     # Сбор элементов из ответа
-    elems = collect_elements(query)
+    elems: list[Node] = collect_elements(query)
 
     # Формирование списка POI и агрегированных данных по типам (приоритет тегов: place, historic, natural, tourism)
     pois = []
     aggregations = {}
+    poi_dict = {}
     for node in elems:
-        poi_type = node.tags.get("place") or node.tags.get("historic") or node.tags.get("natural") or node.tags.get("tourism")
+        poi_type = node.tags.get("place") or node.tags.get("historic") or node.tags.get("natural") or node.tags.get(
+            "tourism")
         if not poi_type:
             continue
-        pois.append(POIBase(id=node.id, name=node.tags.get("name", "Unknown"), type=poi_type))
+        kwargs = {'id': node.id, "name": node.tags.get("name", "Unknown"), "type": poi_type}
+
+        poi = POI(**kwargs)
+        poi_dict[node.wikidata_id] = poi
+        pois.append(poi)
         aggregations[poi_type] = aggregations.get(poi_type, 0) + 1
-        print(node.tags)
-        print(node.wikidata_link)
-        print("=========")
+
+    entities = get_entities_data(poi_dict.keys())
+    for entity in entities:
+        # Извлекаем ID из URL сущности
+        entity_id = entity["item"]["value"].split("/")[-1]
+        cur_poi = poi_dict.get(entity_id)
+        if cur_poi is None:
+            continue
+
+        label = entity.get("itemLabel", {}).get("value", None)
+        if label is not None:
+            cur_poi.name = label
+        description = entity.get("description", {}).get("value", None)
+        if description is not None:
+            cur_poi.description = description
+        image = entity.get("image", {}).get("value", None)
+        if image is not None:
+            cur_poi.image_url = image
+        else:
+            del cur_poi
+    pois.sort(key=lambda poi: (poi.description, poi.image_url, poi.name))
     return FlightPOIResponse(aggregations=aggregations, pois=pois)
 
 
@@ -119,19 +191,13 @@ class PoiIdsRequest(BaseModel):
     poi_ids: List[int]
 
 
-# --- Схемы для ответа ---
-
-class Coordinates(BaseModel):
-    latitude: float
-    longitude: float
-
-
-class PoiDetail(BaseModel):
-    id: int
-    name: str
-    tags: Dict[str, Union[str, int, float]]
-    details: Dict[str, str]
-    coordinates: Coordinates | None = None
+class PoiDetail(POI):
+    summarization: str = "TEST"
+    details: dict
+    tags: dict
+    lat: float | None = Field(default=None)
+    lon: float | None = Field(default=None)
+    inception: str | None = Field(default=None)
 
 
 # --- Эндпойнт для получения подробной информации по списку POI id ---
@@ -164,8 +230,19 @@ async def get_pois_details(poi_ids_request: PoiIdsRequest):
 
     # Собираем подробности для каждого POI, формируя читаемую структуру
     result: Dict[int, PoiDetail] = {}
+    poi_dict: Dict[int, PoiDetail] = {}
+    pois = []
     for node in elems:
-        details = {}
+        poi_type = node.tags.get("place") or node.tags.get("historic") or node.tags.get("natural") or node.tags.get(
+            "tourism")
+        if not poi_type:
+            continue
+        kwargs = {"details": {}, 'id': node.id, "name": node.tags.get("name", "Unknown"), "type": poi_type,
+                  "tags": node.tags}
+        if node.base_geometry:
+            kwargs["lat"] = node.base_geometry.x
+            kwargs["lon"] = node.base_geometry.y
+        details = kwargs["details"]
         # Добавляем описание, если есть
         if "description" in node.tags:
             details["Описание"] = node.tags["description"]
@@ -187,16 +264,63 @@ async def get_pois_details(poi_ids_request: PoiIdsRequest):
             details["Телефон"] = node.tags["phone"]
         if "opening_hours" in node.tags:
             details["Часы работы"] = node.tags["opening_hours"]
-
-        poi_detail = PoiDetail(
-            id=node.id,
-            name=node.tags.get("name", "Unknown"),
-            tags=node.tags,
-            details=details,
-            coordinates=Coordinates(latitude=node.lat, longitude=node.lon)
-            if hasattr(node, "lat") and hasattr(node, "lon") else None
-        )
+        poi_detail = PoiDetail(**kwargs)
+        pois.append(poi_detail)
         result[node.id] = poi_detail
-
+    entities = get_entities_data(poi_dict.keys())
+    for entity in entities:
+        # Извлекаем ID из URL сущности
+        entity_id = entity["item"]["value"].split("/")[-1]
+        cur_poi: PoiDetail = poi_dict.get(entity_id)
+        if cur_poi is None:
+            continue
+        label = entity.get("itemLabel", {}).get("value", None)
+        if label is not None:
+            cur_poi.name = label
+        description = entity.get("description", {}).get("value", None)
+        if description is not None:
+            cur_poi.description = description
+        image = entity.get("image", {}).get("value", None)
+        if image is not None:
+            cur_poi.image_url = image
+        inception = entity.get("inception", {}).get("value", "Нет даты основания")
+        if inception is not None:
+            cur_poi.inception = inception
     return result
 
+
+# Ваш API-ключ для OpenRouter (в случае использования OpenRouter, ключ может отличаться)
+OPEN_AI_API_KEY = os.environ.get("OPEN_ROUTER_API_KEY")
+client = OpenAI(api_key=OPEN_AI_API_KEY, base_url="https://openrouter.ai/api/v1/chat/completions")
+async_client = AsyncOpenAI(api_key=OPEN_AI_API_KEY, base_url="https://openrouter.ai/api/v1/chat/completions")
+
+
+async def stream_assistant_response(assistant_id: str, thread_id: str):
+    # Запускаем стриминг ответа от OpenRouter через бета-эндпоинт
+    stream = async_client.beta.threads.runs.stream(
+        assistant_id=assistant_id,
+        thread_id=thread_id
+    )
+    async with stream as stream:
+        async for text in stream.text_deltas:
+            # Форматируем данные для SSE: каждая порция начинается с "data:" и завершается двумя переводами строки
+            yield f"data: {text}\n\n"
+
+
+@router.post("/{poi_id}/summarize", response_model=Dict[int, PoiDetail])
+async def get_pois_details(poi_id: int):
+    entities = await get_pois_details(PoiIdsRequest(poi_ids=[poi_id]))
+    poi = entities.get(poi_id)
+    message = f"""Твоя задача рассказать связную выжимку по объекту, которому я тебе представлю в качестве JSON.
+Не выдумывай факты и используй только свои знания и информацию из JSON:{poi.model_dump()}.
+"""
+    client.beta.threads.messages.create(
+
+        role="user",
+        content=message
+    )
+    # Возвращаем StreamingResponse, который по мере поступления данных из генератора отправляет их клиенту
+    return StreamingResponse(
+        stream_assistant_response(assistant_id, thread_id),
+        media_type="text/event-stream"
+    )

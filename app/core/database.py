@@ -37,7 +37,3 @@ def get_metadata():
     return db["flight_metadata"]
 
 
-from wikidata.client import Client
-client = Client()
-# TODO
-#GET IMAGES FROM WIKIDIATA
