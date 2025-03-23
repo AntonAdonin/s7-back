@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import os
 from enum import Enum
 from typing import Union, List, Dict
@@ -9,12 +11,15 @@ from fastapi import APIRouter
 from fastapi import HTTPException
 from openai import OpenAI, AsyncOpenAI
 from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse, Response
 
 from app.api.service.flight import get_flight_info
 from app.api.service.poi import make_poly_str
 
 api = Client(url=os.environ.get("OSM_OVERPASS_API_URL"))
 router = APIRouter(prefix="/poi", tags=["poi"])
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 # --- Общие модели и перечисления ---
@@ -49,17 +54,18 @@ class FilterRequest(BaseModel):
         FilterCondition(key="nature", operator=Operator.EQ, value="water"),
         FilterCondition(key="nature", operator=Operator.EQ, value="mountain"),
     ]
-    with_summarization: bool = Field(default=False)
 
 
 class POI(BaseModel):
     id: int = Field(default=0)
-    name: str = Field(default="Novosibirsk")
-    type: str = Field(default="place")
-    description: str = Field(default="Description")
+    name: str = Field(default="")
+    type: str = Field(default="")
+    description: str = Field(default="")
     image_url: str = Field(
-        default="https://avatars.mds.yandex.net/i?id=575a8e9e87e6782ddc215eabc924489ddb142866-5298260-images-thumbs&n=13")
+        default=None)
     website: str = Field(default="https://s7.ru")
+    lat: float | None = Field(default=None)
+    lon: float | None = Field(default=None)
 
 
 class FlightPOIResponse(BaseModel):
@@ -158,7 +164,9 @@ async def get_aggregated_pois(icao24: str, filter: FilterRequest):
         if not poi_type:
             continue
         kwargs = {'id': node.id, "name": node.tags.get("name", "Unknown"), "type": poi_type}
-
+        if node.base_geometry:
+            kwargs["lat"] = node.base_geometry.x
+            kwargs["lon"] = node.base_geometry.y
         poi = POI(**kwargs)
         poi_dict[node.wikidata_id] = poi
         pois.append(poi)
@@ -181,10 +189,12 @@ async def get_aggregated_pois(icao24: str, filter: FilterRequest):
         image = entity.get("image", {}).get("value", None)
         if image is not None:
             cur_poi.image_url = image
-        else:
-            del cur_poi
-    pois.sort(key=lambda poi: (poi.description, poi.image_url, poi.name))
-    return FlightPOIResponse(aggregations=aggregations, pois=pois)
+    result = []
+    for i in pois:
+        if i.image_url is not None:
+            result.append(i)
+    result.sort(key=lambda poi: (poi.description, poi.image_url, poi.name), reverse=True)
+    return FlightPOIResponse(aggregations=aggregations, pois=result)
 
 
 class PoiIdsRequest(BaseModel):
@@ -192,11 +202,9 @@ class PoiIdsRequest(BaseModel):
 
 
 class PoiDetail(POI):
-    summarization: str = "TEST"
     details: dict
     tags: dict
-    lat: float | None = Field(default=None)
-    lon: float | None = Field(default=None)
+
     inception: str | None = Field(default=None)
 
 
@@ -289,38 +297,63 @@ async def get_pois_details(poi_ids_request: PoiIdsRequest):
     return result
 
 
+class CompletionRequest(BaseModel):
+    prompt: str = Field(default="")
+    max_tokens: int | None = Field(default=300)
+    poi_id: int = 10920237687
+    icao24: str | None = "ab68f9"
+    model: str | None = Field(default="deepseek/deepseek-r1-zero:free")
+
+
 # Ваш API-ключ для OpenRouter (в случае использования OpenRouter, ключ может отличаться)
-OPEN_AI_API_KEY = os.environ.get("OPEN_ROUTER_API_KEY")
-client = OpenAI(api_key=OPEN_AI_API_KEY, base_url="https://openrouter.ai/api/v1/chat/completions")
-async_client = AsyncOpenAI(api_key=OPEN_AI_API_KEY, base_url="https://openrouter.ai/api/v1/chat/completions")
+@router.post("/summarize", response_class=StreamingResponse)
+async def get_poi_summarizations(request: CompletionRequest):
+    poi_id = request.poi_id
+    try:
+        # Одновременное получение данных о POI и информации о полете
+        entities, flight = await asyncio.gather(
+            get_pois_details(PoiIdsRequest(poi_ids=[poi_id])),
+            get_flight_info(icao24=request.icao24)
+        )
+        flight.waypoints = []
+        poi = entities.get(poi_id)
+        serialized_flight = flight.model_dump()
+        serialized_flight.pop("count")
+        serialized_poi = poi.model_dump()
 
+        message = (f"Ты – профессиональный экскурсовод."
+                   f"Твоя задача – предоставить краткую, связную и понятную выжимку по объекту,"
+                   f"данные о котором содержатся в приведенном JSON\n"
+                   f"Текст должен быть написан естественным языком, без технических терминов или метаданных.\n"
+                   f"Сфокусируйся на интересных и значимых фактах об объекте, сохраняя ответ лаконичным и точным."
+                   f"Выжимку предоставь на русском языке."
+                   #f"информация о полете - \n"
+                   #f"{serialized_flight}\n"
+                   f"информация об объекте - \n"
+                   f"{serialized_poi}\n")
+        OPEN_AI_API_KEY = os.environ.get("OPEN_ROUTER_API_KEY")
+        # client = OpenAI(api_key=OPEN_AI_API_KEY, base_url="https://openrouter.ai/api/v1")
+        async_client = AsyncOpenAI(api_key=OPEN_AI_API_KEY, base_url="https://openrouter.ai/api/v1")
+        # Используем completions endpoint вместо chat completions
+        stream_response = await async_client.completions.create(
+            model=request.model,
+            prompt=message,
+            stream=True,
+            temperature=0.2,
+            max_tokens=4096,
+            stop=["\n\n",],
 
-async def stream_assistant_response(assistant_id: str, thread_id: str):
-    # Запускаем стриминг ответа от OpenRouter через бета-эндпоинт
-    stream = async_client.beta.threads.runs.stream(
-        assistant_id=assistant_id,
-        thread_id=thread_id
-    )
-    async with stream as stream:
-        async for text in stream.text_deltas:
-            # Форматируем данные для SSE: каждая порция начинается с "data:" и завершается двумя переводами строки
-            yield f"data: {text}\n\n"
+        )
 
+        full_text = ""
+        async for chunk in stream_response:
+            # print(chunk.choices[0])
+            # print(chunk)
+            text_chunk = chunk.choices[0].text
+            print(text_chunk)
+            full_text += text_chunk
+        return Response(full_text, media_type="text/plain; charset=utf-8")
 
-@router.post("/{poi_id}/summarize", response_model=Dict[int, PoiDetail])
-async def get_pois_details(poi_id: int):
-    entities = await get_pois_details(PoiIdsRequest(poi_ids=[poi_id]))
-    poi = entities.get(poi_id)
-    message = f"""Твоя задача рассказать связную выжимку по объекту, которому я тебе представлю в качестве JSON.
-Не выдумывай факты и используй только свои знания и информацию из JSON:{poi.model_dump()}.
-"""
-    client.beta.threads.messages.create(
-
-        role="user",
-        content=message
-    )
-    # Возвращаем StreamingResponse, который по мере поступления данных из генератора отправляет их клиенту
-    return StreamingResponse(
-        stream_assistant_response(assistant_id, thread_id),
-        media_type="text/event-stream"
-    )
+    except Exception as e:
+        logger.exception(e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
